@@ -925,7 +925,7 @@ public class NodeImpl implements Node, RaftServerService {
             }
         };
         name = "JRaft-ElectionTimer-" + suffix;
-        this.electionTimer = new RepeatedTimer(name, this.options.getElectionTimeoutMs(),
+        this.electionTimer = new RepeatedTimer(name, this.options.getElectionTimeoutMs()/*default: 1000*/,
             TIMER_FACTORY.getElectionTimer(this.options.isSharedElectionTimer(), name)) {
 
             @Override
@@ -935,7 +935,7 @@ public class NodeImpl implements Node, RaftServerService {
 
             @Override
             protected int adjustTimeout(final int timeoutMs) {
-                return randomTimeout(timeoutMs);
+                return randomTimeout(timeoutMs) /*random: 1000-2000*/;
             }
         };
         name = "JRaft-StepDownTimer-" + suffix;
@@ -1123,29 +1123,43 @@ public class NodeImpl implements Node, RaftServerService {
         long oldTerm;
         try {
             LOG.info("Node {} start vote and grant vote self, term={}.", getNodeId(), this.currTerm);
+
+            // 1. 再次校验必须 conf 有自己
             if (!this.conf.contains(this.serverId)) {
                 LOG.warn("Node {} can't do electSelf as it is not in {}.", getNodeId(), this.conf);
                 return;
             }
+
+            // 2. 再次校验自身状态
             if (this.state == State.STATE_FOLLOWER) {
                 LOG.debug("Node {} stop election timer, term={}.", getNodeId(), this.currTerm);
                 this.electionTimer.stop();
             }
+
+            // 小小的重置 leader Id
             resetLeaderId(PeerId.emptyPeer(), new Status(RaftError.ERAFTTIMEDOUT,
                 "A follower's leader_id is reset to NULL as it begins to request_vote."));
             this.state = State.STATE_CANDIDATE;
+
+            // 3. 没有验证 ABA、 这里直接 + 了 term，因为还是锁内、之前必然校验过了，那上面的也都应该已经校验过了阿 .
             this.currTerm++;
             this.votedId = this.serverId.copy();
             LOG.debug("Node {} start vote timer, term={} .", getNodeId(), this.currTerm);
+
+            // 4. 开启了一个  voteTimer ? 考虑到 rpc 失败、这里就是 某些场景下允许重试 vote 的逻辑
             this.voteTimer.start();
             this.voteCtx.init(this.conf.getConf(), this.conf.isStable() ? null : this.conf.getOldConf());
             oldTerm = this.currTerm;
         } finally {
-            this.writeLock.unlock();
+            this.writeLock.unlock(); // 5. 释放写锁
         }
 
+
+        // 6. 相同的骚操作、释放写锁 -> 读锁
         final LogId lastLogId = this.logManager.getLastLogId(true);
 
+
+        // 7. 再次拿写锁、验证 ABA
         this.writeLock.lock();
         try {
             // vote need defense ABA after unlock&writeLock
@@ -1161,6 +1175,8 @@ public class NodeImpl implements Node, RaftServerService {
                     LOG.warn("Node {} channel init failed, address={}.", getNodeId(), peer.getEndpoint());
                     continue;
                 }
+
+                // 8. 构建 vote 请求
                 final OnRequestVoteRpcDone done = new OnRequestVoteRpcDone(peer, this.currTerm, this);
                 done.request = RequestVoteRequest.newBuilder() //
                     .setPreVote(false) // It's not a pre-vote request.
@@ -1174,9 +1190,11 @@ public class NodeImpl implements Node, RaftServerService {
                 this.rpcService.requestVote(peer.getEndpoint(), done.request, done);
             }
 
+            // 9. 持久化信息要保存的、这可能会导致 写锁时间增加
             this.metaStorage.setTermAndVotedFor(this.currTerm, this.serverId);
             this.voteCtx.grant(this.serverId);
             if (this.voteCtx.isGranted()) {
+                // 10. major 通过要真正成为 leader 了 . 要开启 leader 相关操作了 .
                 becomeLeader();
             }
         } finally {
@@ -1672,7 +1690,7 @@ public class NodeImpl implements Node, RaftServerService {
                     break;
                 }
 
-                //4. 当前 node 也要认为当前的东西有问题、锁住了, 本地 node 的操作用锁锁住 .
+                //4. 当前 node 也要认为当前的 leader 挂了、但是因为是随机超时时间、可能此时 node 不认为 leader 挂了、实际上这里的判断 leader 逻辑走的是随机时间的最小值
                 if (this.leaderId != null /*leaderId 不能为空*/ && !this.leaderId.isEmpty() /*不能为空*/ && isCurrentLeaderValid() /*而且合法*/) {
                     LOG.info(
                         "Node {} ignore PreVoteRequest from {}, term={}, currTerm={}, because the leader {}'s lease is still valid.",
@@ -1680,7 +1698,7 @@ public class NodeImpl implements Node, RaftServerService {
                     break;
                 }
 
-                // 5. 请求者的  term >= 当前 node 的 term
+                // 5. 请求者的  term 必须 >= 当前 node 的 term
                 if (request.getTerm() < this.currTerm) {
                     LOG.info("Node {} ignore PreVoteRequest from {}, term={}, currTerm={}.", getNodeId(),
                         request.getServerId(), request.getTerm(), this.currTerm);
@@ -1690,7 +1708,7 @@ public class NodeImpl implements Node, RaftServerService {
                 }
                 // A follower replicator may not be started when this node become leader, so we must check it.
                 // check replicator state
-                checkReplicator(candidateId);  // 6. check replicator state
+                checkReplicator(candidateId);  // 6. check replicator state ? 没细看
 
                 doUnlock = false;
                 this.writeLock.unlock();
@@ -2574,16 +2592,21 @@ public class NodeImpl implements Node, RaftServerService {
         boolean doUnlock = true;
         this.writeLock.lock();
         try {
+            // 1. 如果自己的状态已经不是 follower 了
             if (this.state != State.STATE_FOLLOWER) {
                 LOG.warn("Node {} received invalid PreVoteResponse from {}, state not in STATE_FOLLOWER but {}.",
                     getNodeId(), peerId, this.state);
                 return;
             }
+
+            // 2. 判断 ABA 问题, 参数中的 term 是发送请求前构建的 term、验证 是否发生了变化 ! 全局的 version 验证思路
             if (term != this.currTerm) {
                 LOG.warn("Node {} received invalid PreVoteResponse from {}, term={}, currTerm={}.", getNodeId(),
                     peerId, term, this.currTerm);
                 return;
             }
+
+            // 4. 响应返回的是 对端的 term、肯定不能比 自己的要大、毕竟自己要成为  海贼王 leader .
             if (response.getTerm() > this.currTerm) {
                 LOG.warn("Node {} received invalid PreVoteResponse from {}, term {}, expect={}.", getNodeId(), peerId,
                     response.getTerm(), this.currTerm);
@@ -2596,6 +2619,7 @@ public class NodeImpl implements Node, RaftServerService {
             // check granted quorum?
             if (response.getGranted()) {
                 this.prevVoteCtx.grant(peerId);
+                /*判断了大多数人的同意*/
                 if (this.prevVoteCtx.isGranted()) {
                     doUnlock = false;
                     electSelf();
@@ -2637,6 +2661,7 @@ public class NodeImpl implements Node, RaftServerService {
     private void preVote() {
         long oldTerm;
         try {
+            // 1. 如果正在进行 snapshot 这样的进程， 不建议进行 投自己
             LOG.info("Node {} term {} start preVote.", getNodeId(), this.currTerm);
             if (this.snapshotExecutor != null && this.snapshotExecutor.isInstallingSnapshot()) {
                 LOG.warn(
@@ -2644,18 +2669,22 @@ public class NodeImpl implements Node, RaftServerService {
                     getNodeId(), this.currTerm);
                 return;
             }
+            // 2. serverId 不在当前的配置文件中、哈哈哈
             if (!this.conf.contains(this.serverId)) {
                 LOG.warn("Node {} can't do preVote as it is not in conf <{}>.", getNodeId(), this.conf);
                 return;
             }
             oldTerm = this.currTerm;
         } finally {
-            this.writeLock.unlock();
+            this.writeLock.unlock(); /*释放了写锁*/
         }
 
+        // 3. 刻意锁之外获取 lastLogId, logManager 方法内会使用读锁
         final LogId lastLogId = this.logManager.getLastLogId(true);
 
         boolean doUnlock = true;
+
+        //4.  写锁 -> 读锁 ->  写锁： 很明显有 api 问题.  是我就不仅仅校验 term 了 .
         this.writeLock.lock();
         try {
             // pre_vote need defense ABA after unlock&writeLock
@@ -2673,12 +2702,14 @@ public class NodeImpl implements Node, RaftServerService {
                     continue;
                 }
                 final OnPreVoteRpcDone done = new OnPreVoteRpcDone(peer, this.currTerm);
+
+                // 5.
                 done.request = RequestVoteRequest.newBuilder() //
                     .setPreVote(true) // it's a pre-vote request.
                     .setGroupId(this.groupId) //
                     .setServerId(this.serverId.toString()) //
                     .setPeerId(peer.toString()) //
-                    .setTerm(this.currTerm + 1) // next term
+                    .setTerm(this.currTerm + 1) // next term , 传递过去的、就是 term + 1.  但是此时自己还没有改、还没成功呢 !
                     .setLastLogIndex(lastLogId.getIndex()) //
                     .setLastLogTerm(lastLogId.getTerm()) //
                     .build();
@@ -2687,7 +2718,7 @@ public class NodeImpl implements Node, RaftServerService {
             this.prevVoteCtx.grant(this.serverId);
             if (this.prevVoteCtx.isGranted()) {
                 doUnlock = false;
-                electSelf();
+                electSelf(); // 大多数节点同意就选择自己 .
             }
         } finally {
             if (doUnlock) {
